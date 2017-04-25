@@ -49,8 +49,7 @@ public:
 		return outputCount_;
 	}
 
-	virtual void setErrorHandler(const size_t &index,
-		std::function<bool(const std::exception &)> errorHandler) {
+	virtual void setErrorHandler(std::function<bool(const std::exception &)> errorHandler) {
 		errorHandler_ = errorHandler;
 	}
 
@@ -162,7 +161,7 @@ private:
 		}
 	}
 
-private:
+protected:
 	size_t inputCount_ = 0;
 	size_t outputCount_ = 0;
 
@@ -350,6 +349,290 @@ protected:
 	std::mutex mutex_;
 	std::thread proc_;
 	bool running_ = false;
+};
+
+class BaseMediaProcessThreadedPipe : public BaseMediaProcessPipe {
+public:
+    explicit BaseMediaProcessThreadedPipe(const uint8_t count = 1) : count_(count) {
+    }
+
+    ~BaseMediaProcessThreadedPipe() {
+        stop(true);
+        wait();
+    }
+
+    virtual const size_t getInputCount() const {
+        return 1;
+    }
+
+    virtual const size_t getOutputCount() const {
+        return 1;
+    }
+
+    virtual void input(const size_t &index, const std::shared_ptr<BaseMediaElement> &mediaElement) {
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        while (running_) {
+            if (me_) {
+                // wait out event
+                meCondOut_.wait(lock);
+            }
+            if ((!me_) && running_) {
+                me_ = mediaElement;
+                meCondIn_.notify_one();
+                return;
+            }
+        }
+    }
+
+    virtual void process(const std::shared_ptr<BaseMediaElement> &mediaElement) {
+        throw std::runtime_error("not impl.");
+    }
+
+    virtual void start() {
+        reset();
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        running_ = true;
+        for (uint8_t i = 0; i < count_; ++i) {
+            threads_.emplace_back(&BaseMediaProcessThreadedPipe::run_, this);
+        }
+    }
+
+    virtual void stop(bool graceful = true) {
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        stopGraceful_ = graceful;
+        running_ = false;
+        cond_.notify_all();
+        meCondOut_.notify_all();
+        meCondIn_.notify_all();
+    }
+
+    virtual void wait() {
+        std::vector<boost::thread> ts;
+        {
+            boost::unique_lock<boost::mutex> lock(mutex_);
+            ts.swap(threads_);
+        }
+
+        std::vector<boost::thread>::iterator tEnd = ts.end();
+        std::vector<boost::thread>::iterator t = ts.begin();
+        while (t != tEnd) {
+            if (t->joinable()) {
+                t->join();
+            }
+            ++t;
+        }
+    }
+
+    virtual void reset() {
+        stop(true);
+        wait();
+
+        assert(threads_.empty());
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        me_ = nullptr;
+        meCondOut_.notify_one();
+    }
+
+private:
+    void run_() {
+        while (running_) {
+            std::shared_ptr<BaseMediaElement> currMe(nullptr);
+            // try pick a media-element from input.
+            {
+                boost::unique_lock<boost::mutex> lock(mutex_);
+                if (!me_) {
+                    meCondIn_.wait(lock);
+                }
+
+                if (running_ && me_) {
+                    me_.swap(currMe);
+                    meCondOut_.notify_one();
+                }
+            }
+
+            // run with post operation
+            if (running_ && currMe) {
+                process(currMe);
+
+                // post output operation is single-thread.
+                std::unique_lock<std::mutex> lock(postRunMutex_);
+                if (running_) {
+                    if (outputHandlers_.find(0) != outputHandlers_.end()) {
+                        outputHandlers_[0](currMe);
+                    }
+                }
+            }
+        }
+
+        // last call for graceful exit.
+        std::unique_lock<std::mutex> lock(postRunMutex_);
+        if (stopGraceful_) {
+            if (me_) {
+                if (outputHandlers_.find(0) != outputHandlers_.end()) {
+                    outputHandlers_[0](me_);
+                }
+                me_ = nullptr;
+            }
+        }
+    }
+
+protected:
+    bool running_ = false;
+
+    // thread count
+    uint8_t count_;
+
+    // global mutex
+    boost::mutex mutex_;
+
+    // can using wait for interrupt
+    boost::condition_variable cond_;
+
+private:
+    boost::condition_variable meCondIn_;
+    boost::condition_variable meCondOut_;
+    std::shared_ptr<BaseMediaElement> me_ = nullptr;
+
+    std::vector<boost::thread> threads_;
+
+    std::mutex postRunMutex_;
+
+    bool stopGraceful_ = true;
+};
+
+
+class BaseMediaProcessCachePipe : public BaseMediaProcessPipe {
+public:
+    explicit BaseMediaProcessCachePipe(const size_t lowLevel = 0, const size_t highLevel = SIZE_MAX) :
+        BaseMediaProcessPipe(), lowLevel_(lowLevel), highLevel_(highLevel) {
+    }
+
+    ~BaseMediaProcessCachePipe() {
+        stop();
+        wait();
+    }
+
+    virtual const size_t getInputCount() const {
+        return 1;
+    }
+
+    virtual const size_t getOutputCount() const {
+        return 1;
+    }
+
+    virtual bool dealHighLevel(const std::shared_ptr<BaseMediaElement> &mediaElement) {
+        return false;
+    };
+
+    virtual void input(const size_t &index, const std::shared_ptr<BaseMediaElement> &mediaElement) {
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        while (running_) {
+            while (cache_.size() >= highLevel_) {
+                // block here
+                if (dealHighLevel(mediaElement)) {
+                    return;
+                }
+                enterLowCond_.wait(lock);
+            }
+
+            if (running_ && (cache_.size() < highLevel_)) {
+                cache_.insert(mediaElement);
+                if (cache_.size() == 1) {
+                    // first
+                    firstCond_.notify_one();
+                }
+                return;
+            }
+        }
+    }
+
+    virtual void start() {
+        reset();
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        running_ = true;
+        boost::thread t(&BaseMediaProcessCachePipe::run_, this);
+        proc_.swap(t);
+    }
+
+    virtual void stop(bool graceful = true) {
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        stopGraceful_ = graceful;
+        running_ = false;
+        enterLowCond_.notify_all();
+        enterLowCond_.notify_all();
+        firstCond_.notify_all();
+    }
+
+    virtual void wait() {
+        if (proc_.joinable()) {
+            proc_.join();
+        }
+    }
+
+    virtual void reset() {
+        stop(true);
+        wait();
+
+        boost::unique_lock<boost::mutex> lock(mutex_);
+        cache_.clear();
+    }
+
+private:
+    void run_() {
+        while (running_) {
+            std::shared_ptr<BaseMediaElement> me = nullptr;
+
+            // pick out
+            {
+                boost::unique_lock<boost::mutex> lock(mutex_);
+                if (cache_.size() > 0) {
+                    std::set<std::shared_ptr<BaseMediaElement> >::iterator x = cache_.begin();
+                    me = *x;
+
+                    cache_.erase(x);
+                    if (cache_.size() == lowLevel_) {
+                        enterLowCond_.notify_one();
+                    }
+                }
+                else {
+                    // wait new till 1 second.
+                    firstCond_.wait_for(lock, boost::chrono::seconds(1));
+                }
+            }
+
+            if (me) {
+                if (outputHandlers_.find(0) != outputHandlers_.end()) {
+                    outputHandlers_[0](me);
+                }
+            }
+        }
+
+        if (stopGraceful_) {
+            // process remain data.
+            boost::unique_lock<boost::mutex> lock(mutex_);
+            if (outputHandlers_.find(0) != outputHandlers_.end()) {
+                for (auto me : cache_) {
+                    outputHandlers_[0](me);
+                }
+            }
+            cache_.clear();
+        }
+
+        running_ = false;
+    }
+
+private:
+    bool running_ = false;
+    boost::mutex mutex_;
+    boost::condition_variable enterLowCond_;
+    boost::condition_variable enterHighCond_;
+    boost::condition_variable firstCond_;
+    boost::thread proc_;
+
+    size_t lowLevel_;
+    size_t highLevel_;
+    std::set<std::shared_ptr<BaseMediaElement> > cache_;
+    bool stopGraceful_ = true;
 };
 
 #endif // MEDIA_PROCESS_H_
