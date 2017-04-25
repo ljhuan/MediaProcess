@@ -5,10 +5,10 @@
 #include <fstream>
 #include "media_element.h"
 #include "media_process.h"
-#include "boost/filesystem.hpp"
+// #include "boost/filesystem.hpp"
 
 using namespace std;
-using namespace boost::filesystem;
+// using namespace boost::filesystem;
 
 void usage(const char *cmd) {
 	std::cout << "usage: " << cmd << " image-file-path" << std::endl;
@@ -30,8 +30,10 @@ public:
 			auto me = std::make_shared<BaseMediaElement>();
 			me->setMetadata<size_t>("count", count_);
 			me->setMetadata<size_t>("step", 0);
+			outputHandlers_[0](me);
 			return true;
 		}
+		return false;
 	}
 private:
 	size_t count_ = 10;
@@ -48,7 +50,7 @@ public:
 		return 0;
 	}
 
-	virtual void input(const std::string &name, const std::shared_ptr<BaseMediaElement> &mediaElement) {
+	virtual void input(const size_t &index, const std::shared_ptr<BaseMediaElement> &mediaElement) {
 		auto count = mediaElement->getMetadata<size_t>("count");
 		std::cout << "count:" << count << std::endl;
 	}
@@ -57,8 +59,8 @@ public:
 class Task001: public BaseMediaProcessRunloop {
 public:
 	Task001(): BaseMediaProcessRunloop(
-		std::make_shared<MPProductor>,
-		std::make_shared<MPShow>
+		std::make_shared<MPProductor>(),
+		std::make_shared<MPShow>()
 		) {}
 };
 
