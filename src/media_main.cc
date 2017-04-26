@@ -5,10 +5,11 @@
 #include <fstream>
 #include "media_element.h"
 #include "media_process.h"
-// #include "boost/filesystem.hpp"
+#include "media_task.h"
+#include "boost/filesystem.hpp"
 
 using namespace std;
-// using namespace boost::filesystem;
+using namespace boost::filesystem;
 
 void usage(const char *cmd) {
 	std::cout << "usage: " << cmd << " image-file-path" << std::endl;
@@ -56,17 +57,22 @@ public:
 	}
 };
 
-class Task001: public BaseMediaProcessRunloop {
+/*class Task001: public BaseMediaProcessRunloop {
 public:
 	Task001(): BaseMediaProcessRunloop(
 		std::make_shared<MPProductor>(),
 		std::make_shared<MPShow>()
 		) {}
-};
+};*/
 
 int main(int argc, char const *argv[]) {
 	std::cout << "hello media process!" << std::endl;
-	Task001 t1;
+	if (argc != 2) {
+        usage(argv[0]);
+        std::exit(1);
+    }
+    string path = argv[1];
+	Task001 t1(path);
 	t1.run();
 	return 0;
 }
